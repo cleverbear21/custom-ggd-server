@@ -1,4 +1,5 @@
 package everyos.ggd.server.server;
+import everyos.ggd.server.server.r1025.R1025Matchmaker;
 
 import java.net.InetSocketAddress;
 import java.net.UnknownHostException;
@@ -96,14 +97,179 @@ public class GGDServer extends WebSocketServer {
 	}
 
 	@Override
-	public void onMessage(WebSocket conn, ByteBuffer packetBuffer) {
-		Event event = decodeEvent(packetBuffer);
-		if (event.code() == Event.PING) {
-			conn.send(encodeEvent(Event.createPongEvent()));
-		}
-		clients.get(conn).onEvent(event);
-	}
-	
+    public void onMessage(WebSocket conn, ByteBuffer packetBuffer) {
+       byte[] packet = getPacket(packetBuffer);
+
+       try {
+         if (looksLikeR1025(packet)) {
+            handleR1025(conn, packet);
+            return;
+           }
+       } catch (Exception e) {
+           logger.warn("r1025 decode failed", e);
+       }
+
+       Event event = decodeEvent(ByteBuffer.wrap(packet));
+
+       if (event.code() == Event.PING) {
+        conn.send(encodeEvent(Event.createPongEvent()));
+       }
+
+       clients.get(conn).onEvent(event);
+    }
+	private boolean looksLikeR1025(byte[] packet) {
+      if (packet.length == 0) {
+        return false;
+      }
+
+      int first = packet[0] & 0xff;
+
+      return first == 0x08 ||
+           first == 0x10 ||
+           first == 0x18 ||
+           first == 0x20 ||
+           first == 0x0a;
+    }
+	private void handleR1025(WebSocket conn, byte[] packet) {
+      R1025Proto.Reader reader = new R1025Proto.Reader(packet);
+
+      int control = 0;
+      byte[] envelope = null;
+
+      while (reader.hasNext()) {
+          long tag = reader.readVarint();
+
+          int field = (int) (tag >>> 3);
+          int wire = (int) (tag & 7);
+
+          switch (field) {
+              case 1:
+                  if (wire == 0) {
+                    control = (int) reader.readVarint();
+                  } else {
+                    reader.skip(wire);
+                  }
+                  break;
+
+              case 2:
+                  if (wire == 2) {
+                    envelope = reader.readBytes();
+                  } else {
+                    reader.skip(wire);
+                  }
+                  break;
+
+              default:
+                  reader.skip(wire);
+                  break;
+          }
+      }
+
+      logger.info(
+          "r1025 packet: control={}, envelope={}",
+          control,
+          envelope == null ? 0 : envelope.length
+      );
+
+    // Client transport ping.
+      if (control == 0) {
+          conn.send(
+              ByteBuffer.wrap(
+                  new R1025Proto.Writer()
+                      .varint(1, 1)
+                      .toByteArray()
+              )
+          );
+          return;
+      }
+
+    // Matchmaker handshake.
+      if (control == 2) {
+          String clientId = "ggd-" + conn.hashCode();
+          String fd = "r1025-" + conn.hashCode();
+
+          R1025Proto.Writer response =
+              new R1025Proto.Writer();
+
+          response.varint(1, 2);
+          response.string(3, clientId);
+          response.string(4, fd);
+
+          conn.send(
+              ByteBuffer.wrap(response.toByteArray())
+          );
+
+          logger.info(
+              "Sending r1025 handshake: clientId={}, fd={}",
+              clientId,
+              fd
+          );
+
+          return;
+      }
+
+    // Application message.
+      if (control == 3 && envelope != null) {
+          R1025Proto.Reader env =
+              new R1025Proto.Reader(envelope);
+
+          String type = null;
+          byte[] payload = null;
+
+          while (env.hasNext()) {
+              long tag = env.readVarint();
+
+              int field = (int) (tag >>> 3);
+              int wire = (int) (tag & 7);
+
+              switch (field) {
+                  case 1:
+                      if (wire == 2) {
+                        type = env.readString();
+                      } else {
+                        env.skip(wire);
+                      }
+                      break;
+
+                  case 2:
+                      if (wire == 2) {
+                        payload = env.readBytes();
+                      } else {
+                        env.skip(wire);
+                      }
+                      break;
+
+                  default:
+                      env.skip(wire);
+                      break;
+              }
+          }
+
+          logger.info(
+              "r1025 application type={}, payload={}",
+              type,
+              payload == null ? 0 : payload.length
+          );
+
+          if ("/m".equals(type)
+                  && payload != null
+                  && R1025Matchmaker.isHalloweenRequest(payload)) {
+
+              byte[] response =
+                  R1025Matchmaker.createSuccessResponse();
+
+              conn.send(
+                  R1025Matchmaker.wrapApplication(response)
+              );
+
+              logger.info(
+                  "Sent r1025 HALLOWEEN matchmaker response"
+              );
+
+              return;
+          }
+      }
+  }
 	@Override
 	public void onError(WebSocket conn, Exception ex) {
 		
